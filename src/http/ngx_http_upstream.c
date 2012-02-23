@@ -870,7 +870,8 @@ ngx_http_upstream_resolve_handler(ngx_resolver_ctx_t *ctx)
                       &ctx->name, ctx->state,
                       ngx_resolver_strerror(ctx->state));
 
-        ngx_http_upstream_finalize_request(r, u, NGX_HTTP_BAD_GATEWAY);
+        /* CHANGE from NGX_HTTP_BAD_GATEWAY to NGX_HTTP_NOT_FOUND because of our propery purpose. */
+        ngx_http_upstream_finalize_request(r, u, NGX_HTTP_NOT_FOUND);
         return;
     }
 
@@ -1469,7 +1470,8 @@ ngx_http_upstream_send_request_handler(ngx_http_request_t *r,
                    "http upstream send request handler");
 
     if (c->write->timedout) {
-        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT);
+        /* CHANGED to our original error code */
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_RETRY);
         return;
     }
 
@@ -1514,7 +1516,8 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
     }
 
     if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
-        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+        /* CHANGED to our original error code. */
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_RETRY);
         return;
     }
 
@@ -1825,15 +1828,16 @@ ngx_http_upstream_test_connect(ngx_connection_t *c)
          * Solaris returns -1 and sets errno
          */
 
-        if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, (void *) &err, &len)
-            == -1)
-        {
-            err = ngx_errno;
+            if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, (void *) &err, &len)
+                == -1)
+            {
+                        err = ngx_errno;
         }
 
         if (err) {
             c->log->action = "connecting to upstream";
             (void) ngx_connection_error(c, err, "connect() failed");
+            sleep(3);
             return NGX_ERROR;
         }
     }
@@ -2874,6 +2878,11 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
             status = NGX_HTTP_NOT_FOUND;
             break;
 
+    //Added for our original error handling
+        case NGX_HTTP_UPSTREAM_FT_RETRY:
+            status = NGX_HTTP_UPSTREAM_FT_RETRY;
+            break;
+
         /*
          * NGX_HTTP_UPSTREAM_FT_BUSY_LOCK and NGX_HTTP_UPSTREAM_FT_MAX_WAITING
          * never reach here
@@ -2891,66 +2900,74 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     }
 
     if (status) {
-        u->state->status = status;
+        if(status != NGX_HTTP_UPSTREAM_FT_RETRY){
+            u->state->status = status;
 
-        if (u->peer.tries == 0 || !(u->conf->next_upstream & ft_type)) {
+            if (u->peer.tries == 0 || !(u->conf->next_upstream & ft_type)) {
 
-#if (NGX_HTTP_CACHE)
+                if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
+                    && (u->conf->cache_use_stale & ft_type))
+                {
+                    ngx_int_t  rc;
 
-            if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
-                && (u->conf->cache_use_stale & ft_type))
-            {
-                ngx_int_t  rc;
+                    rc = u->reinit_request(r);
 
-                rc = u->reinit_request(r);
+                    if (rc == NGX_OK) {
+                        u->cache_status = NGX_HTTP_CACHE_STALE;
+                        rc = ngx_http_upstream_cache_send(r, u);
+                    }
 
-                if (rc == NGX_OK) {
-                    u->cache_status = NGX_HTTP_CACHE_STALE;
-                    rc = ngx_http_upstream_cache_send(r, u);
+                    ngx_http_upstream_finalize_request(r, u, rc);
+                    return;
                 }
-
-                ngx_http_upstream_finalize_request(r, u, rc);
+                
+                ngx_http_upstream_finalize_request(r, u, status);
                 return;
             }
-#endif
+        }else{
+            if (u->peer.connection) {
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "close http upstream connection: %d",
+                    u->peer.connection->fd);
 
-            ngx_http_upstream_finalize_request(r, u, status);
-            return;
+//              if (u->peer.connection->ssl) {
+//                  u->peer.connection->ssl->no_wait_shutdown = 1;
+//                  u->peer.connection->ssl->no_send_shutdown = 1;
+//                  
+//                  (void) ngx_ssl_shutdown(u->peer.connection);
+//              }
+
+                if (u->peer.connection->pool) {
+                    ngx_destroy_pool(u->peer.connection->pool);
+                }
+                ngx_close_connection(u->peer.connection);
+                u->peer.connection = NULL;
+            }
+            ngx_http_upstream_init(r);          
         }
-    }
+    }else{
+        if (u->peer.connection) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "close http upstream connection: %d",
+                u->peer.connection->fd);
 
-    if (u->peer.connection) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "close http upstream connection: %d",
-                       u->peer.connection->fd);
-#if (NGX_HTTP_SSL)
+//          if (u->peer.connection->ssl) {
+//              u->peer.connection->ssl->no_wait_shutdown = 1;
+//              u->peer.connection->ssl->no_send_shutdown = 1;
+//          
+//              (void) ngx_ssl_shutdown(u->peer.connection);
+//          }
 
-        if (u->peer.connection->ssl) {
-            u->peer.connection->ssl->no_wait_shutdown = 1;
-            u->peer.connection->ssl->no_send_shutdown = 1;
+            if (u->peer.connection->pool) {
+                ngx_destroy_pool(u->peer.connection->pool);
+            }
 
-            (void) ngx_ssl_shutdown(u->peer.connection);
+            ngx_close_connection(u->peer.connection);
+            u->peer.connection = NULL;
         }
-#endif
-
-        if (u->peer.connection->pool) {
-            ngx_destroy_pool(u->peer.connection->pool);
-        }
-
-        ngx_close_connection(u->peer.connection);
-        u->peer.connection = NULL;
+        ngx_http_upstream_connect(r, u);
     }
-
-#if 0
-    if (u->conf->busy_lock && !u->busy_locked) {
-        ngx_http_upstream_busy_lock(p);
-        return;
-    }
-#endif
-
-    ngx_http_upstream_connect(r, u);
 }
-
 
 static void
 ngx_http_upstream_cleanup(void *data)
